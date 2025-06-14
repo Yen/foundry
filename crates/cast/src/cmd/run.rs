@@ -1,12 +1,12 @@
 use alloy_consensus::Transaction;
-use alloy_network::{AnyNetwork, TransactionResponse};
+use alloy_network::TransactionResponse;
 use alloy_provider::Provider;
 use alloy_rpc_types::BlockTransactions;
 use clap::Parser;
-use eyre::{Result, WrapErr};
+use eyre::{OptionExt, Result, WrapErr};
 use foundry_cli::{
     opts::{EtherscanOpts, RpcOpts},
-    utils::{handle_traces, init_progress, TraceResult},
+    utils::{apply_block_changes, execute_block_transactions, handle_traces, TraceResult},
 };
 use foundry_common::{is_known_system_sender, shell, SYSTEM_TRANSACTION_TYPE};
 use foundry_compilers::artifacts::EvmVersion;
@@ -19,15 +19,13 @@ use foundry_config::{
     Config,
 };
 use foundry_evm::{
-    executors::{EvmError, TracingExecutor},
+    executors::TracingExecutor,
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode},
     utils::configure_tx_env,
     Env,
 };
 use foundry_evm_core::env::AsEnvMut;
-
-use crate::utils::apply_chain_and_block_specific_env_changes;
 
 /// CLI arguments for `cast run`.
 #[derive(Clone, Debug, Parser)]
@@ -153,22 +151,7 @@ impl RunArgs {
         env.evm_env.block_env.number = tx_block_number;
 
         if let Some(block) = &block {
-            env.evm_env.block_env.timestamp = block.header.timestamp;
-            env.evm_env.block_env.beneficiary = block.header.beneficiary;
-            env.evm_env.block_env.difficulty = block.header.difficulty;
-            env.evm_env.block_env.prevrandao = Some(block.header.mix_hash.unwrap_or_default());
-            env.evm_env.block_env.basefee = block.header.base_fee_per_gas.unwrap_or_default();
-            env.evm_env.block_env.gas_limit = block.header.gas_limit;
-
-            // TODO: we need a smarter way to map the block to the corresponding evm_version for
-            // commonly used chains
-            if evm_version.is_none() {
-                // if the block has the excess_blob_gas field, we assume it's a Cancun block
-                if block.header.excess_blob_gas.is_some() {
-                    evm_version = Some(EvmVersion::Prague);
-                }
-            }
-            apply_chain_and_block_specific_env_changes::<AnyNetwork>(env.as_env_mut(), block);
+            apply_block_changes(&mut env, &mut evm_version, block);
         }
 
         let trace_mode = TraceMode::Call
@@ -202,59 +185,17 @@ impl RunArgs {
             }
 
             if let Some(block) = block {
-                let pb = init_progress(block.transactions.len() as u64, "tx");
-                pb.set_position(0);
-
                 let BlockTransactions::Full(ref txs) = block.transactions else {
                     return Err(eyre::eyre!("Could not get block txs"))
                 };
 
-                for (index, tx) in txs.iter().enumerate() {
-                    // System transactions such as on L2s don't contain any pricing info so
-                    // we skip them otherwise this would cause
-                    // reverts
-                    if is_known_system_sender(tx.from()) ||
-                        tx.transaction_type() == Some(SYSTEM_TRANSACTION_TYPE)
-                    {
-                        pb.set_position((index + 1) as u64);
-                        continue;
-                    }
-                    if tx.tx_hash() == tx_hash {
-                        break;
-                    }
+                // Find the tx index of the transaction.
+                let tx_index = txs
+                    .iter()
+                    .position(|tx| tx.tx_hash() == tx_hash)
+                    .ok_or_eyre("Could not find transaction in block")?;
 
-                    configure_tx_env(&mut env.as_env_mut(), &tx.inner);
-
-                    if let Some(to) = Transaction::to(tx) {
-                        trace!(tx=?tx.tx_hash(),?to, "executing previous call transaction");
-                        executor.transact_with_env(env.clone()).wrap_err_with(|| {
-                            format!(
-                                "Failed to execute transaction: {:?} in block {}",
-                                tx.tx_hash(),
-                                env.evm_env.block_env.number
-                            )
-                        })?;
-                    } else {
-                        trace!(tx=?tx.tx_hash(), "executing previous create transaction");
-                        if let Err(error) = executor.deploy_with_env(env.clone(), None) {
-                            match error {
-                                // Reverted transactions should be skipped
-                                EvmError::Execution(_) => (),
-                                error => {
-                                    return Err(error).wrap_err_with(|| {
-                                        format!(
-                                            "Failed to deploy transaction: {:?} in block {}",
-                                            tx.tx_hash(),
-                                            env.evm_env.block_env.number
-                                        )
-                                    })
-                                }
-                            }
-                        }
-                    }
-
-                    pb.set_position((index + 1) as u64);
-                }
+                execute_block_transactions(&mut env, &mut executor, &txs[..tx_index])?;
             }
         }
 

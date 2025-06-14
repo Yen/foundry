@@ -5,15 +5,19 @@ use crate::{
 };
 use alloy_ens::NameOrAddress;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_provider::Provider;
 use alloy_rpc_types::{
     state::{StateOverride, StateOverridesBuilder},
-    BlockId, BlockNumberOrTag,
+    BlockId, BlockTransactions,
 };
 use clap::Parser;
-use eyre::Result;
+use eyre::{OptionExt, Result};
 use foundry_cli::{
     opts::{EthereumOpts, TransactionOpts},
-    utils::{self, handle_traces, parse_ether_value, TraceResult},
+    utils::{
+        self, apply_block_changes, execute_block_transactions, handle_traces, parse_ether_value,
+        TraceResult,
+    },
 };
 use foundry_common::shell;
 use foundry_compilers::artifacts::EvmVersion;
@@ -29,6 +33,7 @@ use foundry_evm::{
     executors::TracingExecutor,
     opts::EvmOpts,
     traces::{InternalTraceMode, TraceMode},
+    Env,
 };
 use regex::Regex;
 use revm::context::TransactionType;
@@ -90,6 +95,10 @@ pub struct CallArgs {
 
     #[arg(long, requires = "trace")]
     decode_internal: bool,
+
+    /// The transaction index to call at.
+    #[arg(long, requires = "trace")]
+    index: Option<usize>,
 
     /// Labels to apply to the traces; format: `address:label`.
     /// Can only be used with `--trace`.
@@ -190,7 +199,7 @@ impl CallArgs {
             command,
             block,
             trace,
-            evm_version,
+            mut evm_version,
             debug,
             decode_internal,
             labels,
@@ -234,14 +243,53 @@ impl CallArgs {
             .await?;
 
         if trace {
-            if let Some(BlockId::Number(BlockNumberOrTag::Number(block_number))) = self.block {
-                // Override Config `fork_block_number` (if set) with CLI value.
-                config.fork_block_number = Some(block_number);
+            // Get the call block.
+            let call_block = provider
+                .get_block(self.block.unwrap_or_default())
+                .full()
+                .await?
+                .ok_or_eyre("Could not get call block")?;
+
+            // Calculate the transaction index.
+            let index = self.index.unwrap_or(call_block.transactions.len());
+
+            // The index at `txs + 1` is the standard index at the end of the block.
+            let end_of_block_index = call_block.transactions.len();
+
+            // If the index is past the end of the block, error.
+            if index > end_of_block_index {
+                return Err(eyre::eyre!(
+                    "Transaction index {} is out of range for the block {} with {} transactions",
+                    index,
+                    call_block.header.number,
+                    call_block.transactions.len()
+                ));
             }
+
+            // If the index is at the end of the block, we can fork the call block directly. If the
+            // index is before the end of the block, we fork at the previous block and simulate all
+            // the txs in the call block up to the index.
+            let call_block_and_txs = if index == end_of_block_index {
+                None
+            } else {
+                config.fork_block_number = Some(call_block.header.number - 1);
+
+                let BlockTransactions::Full(ref txs) = call_block.transactions else {
+                    return Err(eyre::eyre!("Could not get block txs"))
+                };
+
+                let previous_txs: Vec<_> = txs.into_iter().take(index).cloned().collect();
+                Some((call_block, previous_txs))
+            };
 
             let create2_deployer = evm_opts.create2_deployer;
             let (mut env, fork, chain, odyssey) =
                 TracingExecutor::get_fork_material(&config, evm_opts).await?;
+
+            // if we forked the previous block, update the env to the call block.
+            if let Some((call_block, _)) = &call_block_and_txs {
+                apply_block_changes(&mut env, &mut evm_version, call_block);
+            }
 
             // modify settings that usually set in eth_call
             env.evm_env.cfg_env.disable_block_gas_limit = true;
@@ -256,7 +304,7 @@ impl CallArgs {
                 })
                 .with_state_changes(shell::verbosity() > 4);
             let mut executor = TracingExecutor::new(
-                env,
+                env.clone(),
                 fork,
                 evm_version,
                 trace_mode,
@@ -264,6 +312,17 @@ impl CallArgs {
                 create2_deployer,
                 state_overrides,
             )?;
+
+            if let Some((_, call_txs)) = call_block_and_txs {
+                let mut env = Env::new_with_spec_id(
+                    env.evm_env.cfg_env.clone(),
+                    env.evm_env.block_env.clone(),
+                    env.tx.clone(),
+                    executor.spec_id(),
+                );
+
+                execute_block_transactions(&mut env, &mut executor, &call_txs)?;
+            }
 
             let value = tx.value.unwrap_or_default();
             let input = tx.inner.input.into_input().unwrap_or_default();

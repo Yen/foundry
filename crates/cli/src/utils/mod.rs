@@ -29,6 +29,9 @@ pub use abi::*;
 mod allocator;
 pub use allocator::*;
 
+mod execute;
+pub use execute::*;
+
 // reexport all `foundry_config::utils`
 #[doc(hidden)]
 pub use foundry_config::utils::*;

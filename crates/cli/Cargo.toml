@@ -17,6 +17,7 @@ forge-fmt.workspace = true
 foundry-common.workspace = true
 foundry-config.workspace = true
 foundry-debugger.workspace = true
+foundry-evm-core.workspace = true
 foundry-evm.workspace = true
 foundry-wallets.workspace = true
 foundry-block-explorers.workspace = true
@@ -24,6 +25,7 @@ foundry-block-explorers.workspace = true
 foundry-compilers = { workspace = true, features = ["full"] }
 solar-sema.workspace = true
 
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-dyn-abi.workspace = true
 alloy-json-abi.workspace = true
